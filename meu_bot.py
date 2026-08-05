@@ -1,186 +1,193 @@
-import streamlit as st
-import requests
+import sqlite3
+import threading
 import time
-from datetime import datetime
+import pyautogui
+import pywhatkit as pwk
+import requests
+import streamlit as st
 
-# ================= CONFIGURAÇÕES DO TELEGRAM =================
-TOKEN = "7550457419:AAFw9o7k9f39nS6c6_v6R6Z53h1-v2j2K9E"
-LINK_GRUPO = "https://t.me/+aEbBvr1wOCxhZDI0"
+# --- CONFIGURAÇÕES GLOBAIS ---
+TELEFONE_DESTINO = "+351932387723"
+MOEDAS_PADRAO = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
+precos_anteriores = {}
 
-# Configuração da página do Streamlit
-st.set_page_config(
-    page_title="Crypto Bot Pro - Painel SaaS",
-    page_icon="⚡",
-    layout="wide"
-)
-
-# Inicializar bases de dados na sessão se não existirem
-if 'subscritores' not in st.session_state:
-    st.session_state.subscritores = []
-
-if 'historico_alertas' not in st.session_state:
-    st.session_state.historico_alertas = []
-
-if 'bot_a_correr' not in st.session_state:
-    st.session_state.bot_a_correr = False
-
-
-def enviar_mensagem_telegram(chat_id, texto):
-    """Envia uma mensagem de texto para um chat específico do Telegram."""
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": texto,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True
-    }
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        print(f"Erro ao enviar mensagem Telegram: {e}")
+# --- 1. CONFIGURAÇÃO DA BASE DE DADOS (SQLite) ---
+def inicializar_bd():
+  conexao = sqlite3.connect("historico_alertas.db", check_same_thread=False)
+  cursor = conexao.cursor()
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS alertas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            data TEXT,
+            moeda TEXT,
+            mensagem TEXT
+        )
+    """)
+  conexao.commit()
+  return conexao, cursor
 
 
-def enviar_convite_grupo(chat_id, nome):
-    """Envia o link de convite do grupo por mensagem privada ao novo subscritor."""
-    mensagem = (
-        f"⚡ *Olá {nome}!* O teu registo no *Crypto Bot Pro* foi efetuado com sucesso.\n\n"
-        f"🔗 Podes aceder ao nosso grupo oficial através do link abaixo:\n"
-        f"{LINK_GRUPO}"
+conexao_bd, cursor_bd = inicializar_bd()
+
+
+# --- 2. SISTEMA DE WHATSAPP ---
+def enviar_alerta_whatsapp(mensagem, moeda):
+  try:
+    # Regista o alerta na Base de Dados
+    data_atual = time.strftime("%Y-%m-%d %H:%M:%S")
+    cursor_bd.execute(
+        "INSERT INTO alertas (data, moeda, mensagem) VALUES (?, ?, ?)",
+        (data_atual, moeda, mensagem),
     )
-    enviar_mensagem_telegram(chat_id, mensagem)
+    conexao_bd.commit()
+
+    # Envio automático via WhatsApp
+    pwk.sendwhatmsg_instantly(
+        phone_no=TELEFONE_DESTINO, message=mensagem, wait_time=12, tab_close=False
+    )
+    time.sleep(3)
+    pyautogui.press("enter")
+    time.sleep(1)
+    pyautogui.press("enter")
+    time.sleep(3)
+    pyautogui.hotkey("ctrl", "w")
+    print(f"📲 Alerta enviado e guardado para {moeda}!")
+  except Exception as e:
+    print(f"Erro ao enviar WhatsApp: {e}")
 
 
-# ================= MENU LATERAL =================
-st.sidebar.title("⚡ Gestão de Subscritores")
+# --- 3. MOTOR DE MONITORIZAÇÃO ---
+def executar_bot(moedas, limiar_perc, preco_alvo_custom, direcao_filtro):
+  global precos_anteriores
+  print("--- Bot Avançado Iniciado em Segundo Plano ---")
 
-nome_sub = st.sidebar.text_input("Nome do Utilizador")
-chat_id_sub = st.sidebar.text_input("Chat ID do Telegram")
+  while True:
+    for simbolo in moedas:
+      url = f"https://api.binance.com/api/v3/ticker/price?symbol={simbolo}"
+      try:
+        resposta = requests.get(url)
+        dados = resposta.json()
 
-if st.sidebar.button("➕ Registar Subscritor"):
-    if nome_sub and chat_id_sub:
-        existe = any(s['chat_id'] == chat_id_sub for s in st.session_state.subscritores)
-        if not existe:
-            st.session_state.subscritores.append({"nome": nome_sub, "chat_id": chat_id_sub})
-            st.sidebar.success(f"Subscritor {nome_sub} registado com sucesso!")
-            
-            # Enviar mensagem de boas-vindas e link do grupo automaticamente
-            enviar_convite_grupo(chat_id_sub, nome_sub)
-        else:
-            st.sidebar.warning("Este Chat ID já se encontra registado.")
+        if "price" in dados:
+          preco_atual = float(dados["price"])
+
+          # Verificação de Preço Alvo Exato (se definido)
+          if (
+              preco_alvo_custom
+              and simbolo == "BTCUSDT"
+              and preco_atual >= preco_alvo_custom
+          ):
+            texto_alerta = (
+                f"🎯 ALERTA DE PREÇO-ALVO BTC: Atingiu ${preco_atual:,.2f}!"
+            )
+            enviar_alerta_whatsapp(texto_alerta, simbolo)
+
+          # Verificação de Variação Percentual
+          if simbolo in precos_anteriores:
+            preco_ant = precos_anteriores[simbolo]
+            variacao = ((preco_atual - preco_ant) / preco_ant) * 100
+
+            print(
+                f"[{simbolo}] Preço: ${preco_atual:,.2f} | Variação:"
+                f" {variacao:+.3f}%"
+            )
+
+            if abs(variacao) >= limiar_perc:
+              # Filtro de direção (Apenas subidas, apenas quedas ou ambos)
+              disparar = False
+              if direcao_filtro == "Apenas Subidas" and variacao > 0:
+                disparar = True
+              elif direcao_filtro == "Apenas Quedas" and variacao < 0:
+                disparar = True
+              elif direcao_filtro == "Ambos (Subidas e Quedas)":
+                disparar = True
+
+              if disparar:
+                if variacao > 0:
+                  texto_alerta = (
+                      f"🚀 ALERTA {simbolo}: Subiu para ${preco_atual:,.2f}"
+                      f" ({variacao:+.3f}%)!"
+                  )
+                else:
+                  texto_alerta = (
+                      f"⚠️ ALERTA {simbolo}: Caiu para ${preco_atual:,.2f}"
+                      f" ({variacao:+.3f}%)!"
+                  )
+
+                enviar_alerta_whatsapp(texto_alerta, simbolo)
+          else:
+            print(f"[{simbolo}] Referência inicial: ${preco_atual:,.2f}")
+
+          precos_anteriores[simbolo] = preco_atual
+
+      except Exception as e:
+        print(f"Erro ao consultar {simbolo}: {e}")
+
+      time.sleep(1)
+    time.sleep(10)
+
+
+# --- 4. INTERFACE GRÁFICA (Streamlit) ---
+def main():
+  st.title("⚡ Crypto Bot Pro - Painel de Controlo")
+  st.write(
+      "Gerencia os teus alertas automáticos de criptomoedas e monitoriza o"
+      " histórico."
+  )
+
+  # Sidebar de Configurações
+  st.sidebar.header("Definições do Bot")
+  moedas_selecionadas = st.sidebar.multiselect(
+      "Moedas a monitorizar",
+      ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"],
+      default=MOEDAS_PADRAO,
+  )
+
+  limiar = st.sidebar.slider(
+      "Limiar de Variação (%)", 0.01, 1.0, 0.1, step=0.01
+  )
+
+  direcao = st.sidebar.selectbox(
+      "Direção dos Alertas",
+      ["Ambos (Subidas e Quedas)", "Apenas Subidas", "Apenas Quedas"],
+  )
+
+  preco_btc_alvo = st.sidebar.number_input(
+      "Definir Preço-Alvo Fixo (BTC - Opcional)", value=0.0, step=100.0
+  )
+
+  # Iniciar o bot numa thread separada para não bloquear a página web
+  if "bot_iniciado" not in st.session_state:
+    if st.sidebar.button("🚀 Iniciar Bot"):
+      t = threading.Thread(
+          target=executar_bot,
+          args=(
+              moedas_selecionadas,
+              limiar,
+              preco_btc_alvo,
+              direcao,
+          ),
+          daemon=True,
+      )
+      t.start()
+      st.session_state["bot_iniciado"] = True
+      st.sidebar.success("Bot a correr em segundo plano!")
+
+  # Secção de Histórico guardado na Base de Dados
+  st.divider()
+  st.subheader("📊 Histórico de Alertas Disparados")
+
+  if st.button("🔄 Atualizar Histórico"):
+    cursor_bd.execute(
+        "SELECT data, moeda, mensagem FROM alertas ORDER BY id DESC"
+    )
+    historico = cursor_bd.fetchall()
+    if historico:
+      for linha in historico:
+        st.write(f"**[{linha[0]}] ({linha[1]}):** {linha[2]}")
     else:
-        st.sidebar.error("Preenche o nome e o Chat ID.")
+      st.info("Ainda não existem alertas registados.")
 
-st.sidebar.markdown("---")
-st.sidebar.title("⚙️ Definições do Bot")
 
-moedas_selecionadas = st.sidebar.multiselect(
-    "Moedas a monitorizar",
-    ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "ADAUSDT", "XRPUSDT"],
-    default=["BTCUSDT", "ETHUSDT", "BNBUSDT"]
-)
-
-limiar_variacao = st.sidebar.slider("Limiar de Variação (%)", 0.01, 5.0, 0.10, 0.01)
-
-direcao = st.sidebar.selectbox(
-    "Direção dos Alertas",
-    ["Ambos (Subidas e Quedas)", "Apenas Subidas", "Apenas Quedas"]
-)
-
-st.sidebar.markdown("---")
-col_start, col_stop = st.sidebar.columns(2)
-with col_start:
-    if st.button("🚀 Iniciar Bot"):
-        st.session_state.bot_a_correr = True
-with col_stop:
-    if st.button("⏹️ Parar Bot"):
-        st.session_state.bot_a_correr = False
-
-# ================= CORPO PRINCIPAL =================
-st.title("⚡ Crypto Bot Pro - Painel SaaS")
-st.markdown("Plataforma automatizada de sinais e alertas de criptomoedas em tempo real.")
-
-col1, col2 = st.columns([1, 1])
-
-with col1:
-    st.markdown("### 👥 Lista de Subscritores Ativos")
-    if st.session_state.subscritores:
-        for sub in st.session_state.subscritores:
-            st.markdown(f"- **{sub['nome']}** (ID: `{sub['chat_id']}`)")
-    else:
-        st.info("Ainda não há subscritores registados.")
-
-with col2:
-    st.markdown("### 📊 Histórico de Alertas")
-    if st.button("🔄 Atualizar Histórico"):
-        st.rerun()
-    
-    if st.session_state.historico_alertas:
-        for alerta in reversed(st.session_state.historico_alertas[-10:]):
-            st.text(alerta)
-    else:
-        st.info("Ainda não existem alertas disparados.")
-
-# ================= MOTOR DE MONITORIZAÇÃO =================
-if st.session_state.bot_a_correr:
-    if not moedas_selecionadas:
-        st.warning("Seleciona pelo menos uma moeda para monitorizar.")
-    elif not st.session_state.subscritores:
-        st.warning("Adiciona pelo menos um subscritor para enviar os sinais.")
-    else:
-        status_placeholder = st.empty()
-        status_placeholder.info("🟢 Bot a monitorizar o mercado ativamente em segundo plano...")
-        
-        precos_anteriores = {}
-        
-        while st.session_state.bot_a_correr:
-            for moeda in moedas_selecionadas:
-                try:
-                    url_binance = f"https://api.binance.com/api/v3/ticker/price?symbol={moeda}"
-                    resposta = requests.get(url_binance, timeout=3).json()
-                    
-                    if 'price' not in resposta:
-                        continue
-                        
-                    preco_atual = float(resposta['price'])
-                    
-                    if moeda not in precos_anteriores:
-                        precos_anteriores[moeda] = preco_atual
-                        continue
-                    
-                    preco_ant = precos_anteriores[moeda]
-                    variacao = ((preco_atual - preco_ant) / preco_ant) * 100
-                    
-                    disparar = False
-                    if abs(variacao) >= limiar_variacao:
-                        if direcao == "Ambos (Subidas e Quedas)":
-                            disparar = True
-                        elif direcao == "Apenas Subidas" and variacao > 0:
-                            disparar = True
-                        elif direcao == "Apenas Quedas" and variacao < 0:
-                            disparar = True
-                    
-                    if disparar:
-                        emoji = "🚀" if variacao > 0 else "🔻"
-                        tipo_mov = "SUBIDA" if variacao > 0 else "QUEDA"
-                        
-                        mensagem_alerta = (
-                            f"{emoji} *ALERTA DE CRIPTO - {moeda}* {emoji}\n\n"
-                            f"📈 Movimento: *{tipo_mov}*\n"
-                            f"💵 Preço Atual: *${preco_atual:,.2f}*\n"
-                            f"📊 Variação: *{variacao:+.2f}%*\n"
-                            f"⏰ Hora: {datetime.now().strftime('%H:%M:%S')}"
-                        )
-                        
-                        for sub in st.session_state.subscritores:
-                            enviar_mensagem_telegram(sub['chat_id'], mensagem_alerta)
-                        
-                        registo_historico = f"[{datetime.now().strftime('%H:%M:%S')}] {moeda} -> {variacao:+.2f}% (Preço: ${preco_atual:,.2f})"
-                        st.session_state.historico_alertas.append(registo_historico)
-                        
-                        precos_anteriores[moeda] = preco_atual
-                        
-                except Exception as e:
-                    print(f"Erro ao consultar Binance para {moeda}: {e}")
-            
-            time.sleep(5)
-            st.rerun()
+if __name__ == "__main__":
+  main()
