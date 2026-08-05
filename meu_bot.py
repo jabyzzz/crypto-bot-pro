@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 
 # ================= CONFIGURAÇÕES DO TELEGRAM =================
-TOKEN = "7550457419:AAFw9o7k9f39nS6c6_v6R6Z53h1-v2j2K9E"  # Token recuperado do teu histórico / sessão
+TOKEN = "7550457419:AAFw9o7k9f39nS6c6_v6R6Z53h1-v2j2K9E"
 LINK_GRUPO = "https://t.me/+aEbBvr1wOCxhZDI0"
 
 # Configuração da página do Streamlit
@@ -132,10 +132,7 @@ if st.session_state.bot_a_correr:
         
         precos_anteriores = {}
         
-        for _ in range(50):
-            if not st.session_state.bot_a_correr:
-                break
-                
+        while st.session_state.bot_a_correr:
             for moeda in moedas_selecionadas:
                 try:
                     url_binance = f"https://api.binance.com/api/v3/ticker/price?symbol={moeda}"
@@ -186,5 +183,4 @@ if st.session_state.bot_a_correr:
                     print(f"Erro ao consultar Binance para {moeda}: {e}")
             
             time.sleep(5)
-        
-        st.rerun()
+            st.rerun()
